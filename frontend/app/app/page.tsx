@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Node from "../components/Node";
 
 interface LiveData {
   message: string;
@@ -47,9 +48,23 @@ export default function HomePage() {
       </div>
 
       <div className="data-container">
-        <div id="info-box">
-          <h2>Live Data</h2>
-          <p>{data ? data.message : "Waiting for server data..."}</p>
+        <div className="nodes-wrapper">
+          <Node
+            title="Live Data"
+            content={data ? data.message : "Waiting for server data..."}
+          />
+          <Node
+            title="Speech Analysis"
+            content="Speech pacing, clarity, and volume metrics will appear here."
+          />
+          <Node
+            title="Visual Metrics"
+            content="Eye contact, posture, and gesture analysis will appear here."
+          />
+          <Node
+            title="Engagement Score"
+            content="Overall engagement and performance metrics will appear here."
+          />
         </div>
       </div>
     </div>
