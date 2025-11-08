@@ -1,23 +1,23 @@
-from dotenv import load_dotenv
-import os
 from google.adk.agents.llm_agent import Agent
 
-load_dotenv()
-
-api_key = os.getenv("GOOGLE_API_KEY")
-
-if not api_key:
-    raise ValueError("API key not found. Check your .env file.")
-
 def get_current_time(city: str) -> dict:
-    return {"city": city, "time": "10:30 AM"}
+    """Returns the current time in a specified city."""
+    return {"status": "success", "city": city, "time": "10:30 AM"}
 
+# Create the agent
 root_agent = Agent(
     model="gemini-2.5-flash",
     name="root_agent",
     description="Tells the current time in a specified city.",
-    instruction="Use the get_current_time tool to provide accurate times.",
-    tools=[get_current_time]
+    instruction=(
+        "You are a helpful assistant that tells the current time in cities. "
+        "Use the 'get_current_time' tool for this purpose."
+    ),
+    tools=[get_current_time],
 )
 
-
+# --- Example of calling it programmatically ---
+if __name__ == "__main__":
+    user_input = "What time is it in Tokyo?"
+    response = root_agent.run(user_input)  # Run agent directly
+    print(response)
