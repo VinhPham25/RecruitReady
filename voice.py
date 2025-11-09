@@ -8,8 +8,7 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Optional, Generator, Tuple
 import json
-import threading
-import queue
+import webrtcvad
 
 @dataclass
 class SpeechMetrics:
@@ -31,7 +30,7 @@ class SpeechMetrics:
 
 
 class VoiceAnalyzer:
-    """Analyzes speech patterns using Whisper with text-based VAD"""
+    """Analyzes speech patterns using Whisper with WebRTC VAD for silence detection"""
     
     def __init__(self, model_size="base"):
         """
@@ -43,15 +42,19 @@ class VoiceAnalyzer:
         self.model = whisper.load_model(model_size)
         print("Model loaded!")
         
-        # Audio configuration
-        self.CHUNK = 1024
+        # Audio configuration for WebRTC VAD (requires specific format)
+        self.CHUNK = 480  # 30ms at 16kHz (WebRTC VAD requirement)
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
-        self.RATE = 16000  # Whisper expects 16kHz
+        self.RATE = 16000  # Whisper and WebRTC VAD both expect 16kHz
         
-        # Text-based VAD settings
-        self.TRANSCRIBE_INTERVAL = 0.5  # Transcribe every 0.5 seconds for responsive detection
-        self.NO_SPEECH_DURATION = 2.0  # If no new text for 2 seconds, consider speech ended
+        # Initialize WebRTC VAD (mode 3 = most aggressive silence detection)
+        self.vad = webrtcvad.Vad(3)
+        
+        # Transcription settings
+        self.TRANSCRIBE_INTERVAL = 5.0  # 5 seconds for accurate transcription
+        self.MIN_SPEECH_CHUNK_SIZE = 5.0  # Minimum 5 seconds before first transcription
+        self.SILENCE_DURATION_THRESHOLD = 3.0  # 3 seconds of silence to end speech
         
         # Audio interface
         self.audio = pyaudio.PyAudio()
@@ -59,11 +62,17 @@ class VoiceAnalyzer:
         
         # For tracking current speech segment
         self.full_audio_buffer = []  # Complete audio for final analysis
-        self.recent_audio_buffer = []  # Recent audio for periodic transcription
-        self.accumulated_text = ""
-        self.last_text_time = None
+        self.transcription_buffer = []  # Audio for next transcription
+        self.accumulated_text = ""  # This stores ALL text across all chunks
         self.speech_start_time = None
         self.is_speaking = False
+        self.first_transcription_done = False
+        
+        # WebRTC VAD silence tracking
+        self.silence_frames = 0
+        self.silence_threshold_frames = int((self.SILENCE_DURATION_THRESHOLD * self.RATE) / self.CHUNK)
+        self.speech_frames = 0  # Consecutive speech frames
+        self.speech_threshold_frames = 10  # Need 10 consecutive speech frames to start
         
     def calculate_volume_db(self, audio_chunk: bytes) -> float:
         """Calculate volume in decibels for a single audio chunk"""
@@ -111,8 +120,8 @@ class VoiceAnalyzer:
         except:
             return 0.8
     
-    def transcribe_audio(self, audio_data: bytes) -> Optional[dict]:
-        """Transcribe audio data using Whisper"""
+    def transcribe_audio(self, audio_data: bytes, initial_prompt: str = None) -> Optional[dict]:
+        """Transcribe audio data using Whisper with optional context"""
         temp_filename = f"temp_audio_{int(time.time() * 1000)}.wav"
         
         try:
@@ -123,13 +132,22 @@ class VoiceAnalyzer:
                 wf.setframerate(self.RATE)
                 wf.writeframes(audio_data)
             
-            # Transcribe
-            result = self.model.transcribe(
-                temp_filename,
-                language="en",
-                fp16=False,
-                verbose=False
-            )
+            # Transcribe with context from previous text
+            transcribe_options = {
+                "language": "en",
+                "fp16": False,
+                "verbose": False,
+                "word_timestamps": True,
+                "beam_size": 5,
+                "best_of": 5,
+                "temperature": 0.0
+            }
+            
+            # Add initial prompt for context if we have previous text
+            if initial_prompt:
+                transcribe_options["initial_prompt"] = initial_prompt
+            
+            result = self.model.transcribe(temp_filename, **transcribe_options)
             
             os.remove(temp_filename)
             return result
@@ -179,35 +197,43 @@ class VoiceAnalyzer:
             self.stream.close()
         self.audio.terminate()
     
-    def read_audio_chunk(self) -> Tuple[bytes, float]:
-        """Read a single audio chunk and return data + volume"""
+    def read_audio_chunk(self) -> Tuple[bytes, float, bool]:
+        """Read a single audio chunk and return data + volume + is_speech"""
         try:
             audio_chunk = self.stream.read(self.CHUNK, exception_on_overflow=False)
             volume_db = self.calculate_volume_db(audio_chunk)
-            return audio_chunk, volume_db
+            
+            # Use WebRTC VAD to detect speech
+            is_speech = self.vad.is_speech(audio_chunk, self.RATE)
+            
+            return audio_chunk, volume_db, is_speech
         except Exception as e:
             print(f"Error reading audio: {e}")
-            return b'', -100
+            return b'', -100, False
 
 
 # ============================================================================
-# STREAMING INTERFACE FOR APP.PY WITH TEXT-BASED VAD
+# STREAMING INTERFACE WITH WEBRTC VAD
 # ============================================================================
 
 def stream_voice_with_text_vad(
-    no_speech_duration: float = 2.0,
-    transcribe_interval: float = 0.5,
+    silence_duration: float = 3.0,
+    transcribe_interval: float = 5.0,
     model_size: str = "base"
 ) -> Generator[dict, None, None]:
     """
     Generator that yields real-time updates and complete speech segments when detected.
-    Uses TEXT-BASED Voice Activity Detection - stops when no new text for specified duration.
+    Uses WebRTC VAD for FAST and ACCURATE silence detection + large chunks for transcription.
     
-    This is much more reliable than volume-based detection in noisy environments!
+    KEY FEATURES:
+    - WebRTC VAD for real-time speech/silence detection (industry standard)
+    - 5 second transcription intervals for accurate text
+    - 3 second silence detection (much faster!)
+    - Proper buffer clearing to avoid repeating text
     
     Args:
-        no_speech_duration: Seconds of no new text before considering speech ended (default: 2.0)
-        transcribe_interval: How often to transcribe recent audio (default: 0.5s)
+        silence_duration: Seconds of silence before considering speech ended (default: 3.0)
+        transcribe_interval: How often to transcribe recent audio (default: 5.0s)
         model_size: Whisper model size
         
     Yields:
@@ -215,131 +241,152 @@ def stream_voice_with_text_vad(
         - Real-time status: {"type": "status", "text": "current text...", "is_speaking": True}
         - Speech started: {"type": "speech_started", "timestamp": ...}
         - Complete speech analysis: {"type": "speech_complete", "metrics": {...}}
-        
-        Metrics structure (RAW values only):
-        {
-            "text": "I have three years of experience...",
-            "words_per_minute": 145.0,
-            "volume_db": -52.0,
-            "clarity_score": 0.85,
-            "speech_duration": 8.5,
-            "timestamp": 1699999999.123
-        }
-    
-    Usage in app.py:
-        for data in stream_voice_with_text_vad():
-            if data["type"] == "status":
-                print(f"Current text: {data['text']}")
-                
-            elif data["type"] == "speech_complete":
-                # User finished speaking - send to agent!
-                metrics = data["metrics"]
-                send_to_agent(metrics)
     """
     analyzer = VoiceAnalyzer(model_size=model_size)
-    analyzer.NO_SPEECH_DURATION = no_speech_duration
+    analyzer.SILENCE_DURATION_THRESHOLD = silence_duration
     analyzer.TRANSCRIBE_INTERVAL = transcribe_interval
+    analyzer.silence_threshold_frames = int((silence_duration * analyzer.RATE) / analyzer.CHUNK)
     
     analyzer.start_stream()
     
-    print("Voice analyzer streaming started (text-based VAD)...")
-    print(f"No speech duration: {no_speech_duration} seconds")
+    print("Voice analyzer streaming started (WebRTC VAD)...")
+    print(f"Silence duration: {silence_duration} seconds")
     print(f"Transcribe interval: {transcribe_interval} seconds")
+    print(f"Using WebRTC VAD for fast silence detection!")
     
-    frames_per_interval = int(analyzer.RATE / analyzer.CHUNK * transcribe_interval)
-    frame_count = 0
+    last_transcription_time = time.time()
     
     try:
         while True:
-            audio_chunk, volume_db = analyzer.read_audio_chunk()
+            audio_chunk, volume_db, is_speech = analyzer.read_audio_chunk()
             current_time = time.time()
             
-            # Add to buffers
+            # Always add to full buffer for final analysis
             analyzer.full_audio_buffer.append(audio_chunk)
-            analyzer.recent_audio_buffer.append(audio_chunk)
-            frame_count += 1
             
-            # Periodic transcription to detect new speech
-            if frame_count >= frames_per_interval:
-                frame_count = 0
+            # Track speech/silence using WebRTC VAD
+            if is_speech:
+                analyzer.speech_frames += 1
+                analyzer.silence_frames = 0
                 
-                # Transcribe recent audio
-                recent_audio_data = b''.join(analyzer.recent_audio_buffer)
-                result = analyzer.transcribe_audio(recent_audio_data)
-                
-                if result:
-                    new_text = result.get('text', '').strip()
+                # Start speech after consistent speech detection
+                if not analyzer.is_speaking and analyzer.speech_frames >= analyzer.speech_threshold_frames:
+                    analyzer.is_speaking = True
+                    analyzer.speech_start_time = current_time
+                    print("\n🎤 Speech detected! Recording...")
                     
-                    # Check if there's new meaningful text
-                    if new_text and len(new_text) > 3:
-                        # New speech detected!
-                        if not analyzer.is_speaking:
-                            # Speech just started
-                            analyzer.is_speaking = True
-                            analyzer.speech_start_time = current_time
-                            analyzer.accumulated_text = new_text
-                            analyzer.last_text_time = current_time
-                            
+                    yield {
+                        "type": "speech_started",
+                        "timestamp": current_time
+                    }
+                
+                # Add to transcription buffer while speaking
+                if analyzer.is_speaking:
+                    analyzer.transcription_buffer.append(audio_chunk)
+            else:
+                analyzer.speech_frames = 0
+                
+                if analyzer.is_speaking:
+                    analyzer.silence_frames += 1
+                    # Continue adding to transcription buffer during short silences
+                    analyzer.transcription_buffer.append(audio_chunk)
+                    
+                    # Check if silence threshold exceeded
+                    if analyzer.silence_frames >= analyzer.silence_threshold_frames and analyzer.first_transcription_done:
+                        # Speech has ended!
+                        speech_duration = current_time - analyzer.speech_start_time
+                        full_audio_data = b''.join(analyzer.full_audio_buffer)
+                        
+                        print(f"\n✅ Silence detected ({silence_duration}s) - ending speech")
+                        
+                        # Analyze the complete segment
+                        metrics = analyzer.analyze_speech_segment(
+                            full_audio_data,
+                            speech_duration,
+                            analyzer.accumulated_text
+                        )
+                        
+                        if metrics:
                             yield {
-                                "type": "speech_started",
-                                "timestamp": current_time
+                                "type": "speech_complete",
+                                "metrics": metrics.to_dict()
                             }
-                        else:
-                            # Ongoing speech - check if text is actually new
-                            # Compare with accumulated text to see if there's new content
-                            if new_text not in analyzer.accumulated_text:
-                                analyzer.accumulated_text += " " + new_text
-                                analyzer.last_text_time = current_time
                         
-                        # Yield status update
-                        yield {
-                            "type": "status",
-                            "text": analyzer.accumulated_text,
-                            "is_speaking": True,
-                            "timestamp": current_time
-                        }
-                    
-                    # Check for speech end (no new text)
-                    elif analyzer.is_speaking and analyzer.last_text_time:
-                        silence_duration = current_time - analyzer.last_text_time
+                        # Reset for next segment
+                        analyzer.is_speaking = False
+                        analyzer.full_audio_buffer = []
+                        analyzer.transcription_buffer = []
+                        analyzer.accumulated_text = ""
+                        analyzer.speech_start_time = None
+                        analyzer.first_transcription_done = False
+                        analyzer.silence_frames = 0
+                        analyzer.speech_frames = 0
+                        last_transcription_time = current_time
                         
-                        if silence_duration >= analyzer.NO_SPEECH_DURATION:
-                            # Speech has ended!
-                            speech_duration = current_time - analyzer.speech_start_time
-                            full_audio_data = b''.join(analyzer.full_audio_buffer)
-                            
-                            # Analyze the complete segment
-                            metrics = analyzer.analyze_speech_segment(
-                                full_audio_data,
-                                speech_duration,
-                                analyzer.accumulated_text
-                            )
-                            
-                            if metrics:
-                                yield {
-                                    "type": "speech_complete",
-                                    "metrics": metrics.to_dict()
-                                }
-                            
-                            # Reset for next segment
-                            analyzer.is_speaking = False
-                            analyzer.full_audio_buffer = []
-                            analyzer.accumulated_text = ""
-                            analyzer.last_text_time = None
-                            analyzer.speech_start_time = None
-                
-                # Clear recent buffer for next interval
-                analyzer.recent_audio_buffer = []
+                        continue
             
-            # Yield periodic status even when not transcribing
-            if analyzer.is_speaking and int(current_time * 2) % 2 == 0:  # Every 0.5s
-                yield {
-                    "type": "status",
-                    "text": analyzer.accumulated_text,
-                    "is_speaking": True,
-                    "timestamp": current_time,
-                    "volume_db": volume_db
-                }
+            # Periodic transcription while speaking
+            if analyzer.is_speaking:
+                time_since_last_transcription = current_time - last_transcription_time
+                
+                if time_since_last_transcription >= analyzer.TRANSCRIBE_INTERVAL:
+                    # Check if we have enough audio
+                    transcription_audio = b''.join(analyzer.transcription_buffer)
+                    duration = len(analyzer.transcription_buffer) * analyzer.CHUNK / analyzer.RATE
+                    
+                    if duration >= analyzer.MIN_SPEECH_CHUNK_SIZE or analyzer.first_transcription_done:
+                        print(f"\n[Transcribing {duration:.1f}s of audio...]")
+                        
+                        # Transcribe with context
+                        initial_prompt = analyzer.accumulated_text if analyzer.accumulated_text else None
+                        result = analyzer.transcribe_audio(transcription_audio, initial_prompt=initial_prompt)
+                        
+                        if result:
+                            current_chunk_text = result.get('text', '').strip()
+                            if current_chunk_text and len(current_chunk_text) > 3:
+                                analyzer.first_transcription_done = True
+                                # Only append new, non-repeated text
+                                if not analyzer.accumulated_text:
+                                    analyzer.accumulated_text = current_chunk_text
+                                    print(f"[Initial text: '{current_chunk_text}']")
+                                else:
+                                    # Find the longest suffix of accumulated_text that matches the prefix of current_chunk_text
+                                    overlap = 0
+                                    max_overlap = min(len(analyzer.accumulated_text), len(current_chunk_text))
+                                    for i in range(max_overlap, 0, -1):
+                                        if analyzer.accumulated_text[-i:] == current_chunk_text[:i]:
+                                            overlap = i
+                                            break
+                                    new_text = current_chunk_text[overlap:]
+                                    if new_text:
+                                        # Prevent repeated phrase addition
+                                        last_sentences = analyzer.accumulated_text.split('. ')
+                                        new_sentences = new_text.split('. ')
+                                        # Only add sentences not already present at the end
+                                        for sentence in new_sentences:
+                                            sentence = sentence.strip()
+                                            if sentence and (not analyzer.accumulated_text.endswith(sentence)):
+                                                analyzer.accumulated_text += (" " if analyzer.accumulated_text else "") + sentence
+                                                analyzer.accumulated_text = analyzer.accumulated_text.strip()
+                                                print(f"[New text added: '{sentence}']")
+                                            else:
+                                                print(f"[Skipped repeated sentence: '{sentence}']")
+                                    else:
+                                        print(f"[Text unchanged - user may have paused]")
+                                # Yield status update
+                                yield {
+                                    "type": "status",
+                                    "text": analyzer.accumulated_text,
+                                    "is_speaking": True,
+                                    "timestamp": current_time,
+                                    "word_count": len(analyzer.accumulated_text.split())
+                                }
+                        
+                        # CRITICAL: Clear transcription buffer after transcribing!
+                        analyzer.transcription_buffer = []
+                        last_transcription_time = current_time
+                    else:
+                        print(f"[Collecting audio: {duration:.1f}s / {analyzer.MIN_SPEECH_CHUNK_SIZE:.1f}s]")
     
     finally:
         analyzer.stop_stream()
@@ -347,16 +394,16 @@ def stream_voice_with_text_vad(
 
 
 def listen_for_single_response(
-    no_speech_duration: float = 2.0,
+    silence_duration: float = 3.0,
     model_size: str = "base",
     max_duration: float = 60.0
 ) -> Optional[dict]:
     """
     Listen for a single complete speech response and return RAW metrics.
-    Uses text-based VAD - much more reliable in noisy environments!
+    Uses WebRTC VAD for fast and accurate detection.
     
     Args:
-        no_speech_duration: Seconds of no new text before considering response complete
+        silence_duration: Seconds of silence before considering response complete
         model_size: Whisper model size
         max_duration: Maximum recording duration in seconds
         
@@ -365,7 +412,7 @@ def listen_for_single_response(
     """
     start_time = time.time()
     
-    for data in stream_voice_with_text_vad(no_speech_duration=no_speech_duration, model_size=model_size):
+    for data in stream_voice_with_text_vad(silence_duration=silence_duration, model_size=model_size):
         # Timeout check
         if time.time() - start_time > max_duration:
             print("Max duration exceeded")
@@ -383,12 +430,12 @@ def listen_for_single_response(
 # ============================================================================
 
 def test_text_vad_streaming():
-    """Test the text-based VAD streaming"""
+    """Test the WebRTC VAD streaming"""
     print("\n" + "="*70)
-    print("Testing Text-Based VAD Voice Streaming (RAW metrics)")
+    print("Testing WebRTC VAD Voice Streaming")
     print("="*70)
-    print("Speak naturally. System detects when you stop speaking (no new text).")
-    print("Much more reliable in noisy environments!")
+    print("Speak naturally - WebRTC VAD detects speech/silence!")
+    print("5-second chunks for accuracy + 3-second silence detection!")
     print("Press Ctrl+C to stop\n")
     
     try:
@@ -399,20 +446,23 @@ def test_text_vad_streaming():
             elif data["type"] == "status":
                 # Show real-time transcription
                 text = data["text"]
-                display_text = text if len(text) <= 60 else text[:57] + "..."
-                speaking_indicator = "🔴" if data["is_speaking"] else "⚪"
-                print(f"\r{speaking_indicator} {display_text:<60}", end="", flush=True)
+                word_count = data.get("word_count", 0)
+                # Show more text in display
+                display_text = text if len(text) <= 80 else "..." + text[-77:]
+                speaking_indicator = "🔴"
+                print(f"\r{speaking_indicator} [{word_count} words] {display_text:<80}", end="", flush=True)
             
             elif data["type"] == "speech_complete":
                 metrics = data["metrics"]
                 print("\n\n" + "="*70)
-                print("✅ SPEECH COMPLETE - RAW Metrics (Agent will analyze):")
+                print("✅ SPEECH COMPLETE - RAW Metrics:")
                 print("="*70)
-                print(f"Transcript: {metrics['text']}")
+                print(f"Full Transcript: {metrics['text']}")
                 print(f"Duration: {metrics['speech_duration']:.1f}s")
                 print(f"WPM: {metrics['words_per_minute']:.0f}")
                 print(f"Volume: {metrics['volume_db']:.1f} dB")
                 print(f"Clarity: {metrics['clarity_score']:.2f}")
+                print(f"Total Words: {len(metrics['text'].split())}")
                 print("="*70 + "\n")
                 print("Ready for next response...")
     
@@ -423,18 +473,19 @@ def test_text_vad_streaming():
 def test_single_response():
     """Test listening for a single response"""
     print("\n" + "="*70)
-    print("Testing Single Response Capture (Text-based VAD)")
+    print("Testing Single Response Capture (WebRTC VAD)")
     print("="*70)
-    print("Speak your answer. Stop when you're done.\n")
+    print("Speak your answer. VAD detects when you stop!\n")
     
     print("Listening...")
-    metrics = listen_for_single_response(no_speech_duration=2.0)
+    metrics = listen_for_single_response(silence_duration=3.0)
     
     if metrics:
         print("\n" + "="*70)
         print("Response captured!")
         print("="*70)
-        print(f"Transcript: {metrics['text']}")
+        print(f"Full Transcript: {metrics['text']}")
+        print(f"Total Words: {len(metrics['text'].split())}")
         print(f"WPM: {metrics['words_per_minute']:.0f}")
         print(f"Volume: {metrics['volume_db']:.1f} dB")
         print(f"Duration: {metrics['speech_duration']:.1f}s")
@@ -446,7 +497,7 @@ def test_single_response():
 def main():
     """Main test function"""
     print("\n" + "="*70)
-    print("VOICE ANALYZER - Text-Based VAD (RAW Metrics)")
+    print("VOICE ANALYZER - WebRTC VAD (Industry Standard)")
     print("="*70)
     print("\nChoose test mode:")
     print("1. Continuous streaming (recommended for interviews)")
