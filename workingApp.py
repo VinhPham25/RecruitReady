@@ -1,13 +1,13 @@
 """
-app.py - Integrated Camera + Voice data collection with agent feedback
+tempApp.py - Integrated Camera + Voice data collection with agent feedback
 Camera runs in MAIN thread (OpenCV requirement), Voice runs in background thread
+FIXED: Camera continues until voice collection actually completes (after detecting speech + silence)
 """
 
 import asyncio
 import json
 import threading
 import queue
-import time
 from camera import stream_camera_metrics
 from voice import stream_voice_with_text_vad
 from interview_agent.agent import (
@@ -19,12 +19,6 @@ from interview_agent.agent import (
     session_service,
     types
 )
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-MINIMUM_RECORDING_TIME = 10.0  # Minimum seconds before allowing collection to stop
 
 
 def aggregate_camera_metrics(all_metrics):
@@ -94,14 +88,13 @@ def format_speech_metrics(speech_data):
 - Clarity Score: {speech_data.get('clarity_score', 0):.2f}"""
 
 
-def voice_collector(voice_queue, min_recording_time):
+def voice_collector(voice_queue, stop_event):
     """Thread function to collect voice metrics - runs in BACKGROUND"""
     speech_metrics = None
-    start_time = time.time()
     
     try:
-        print(f"🎤 Voice collector started (minimum {min_recording_time}s)...")
-        for data in stream_voice_with_text_vad(no_speech_duration=2.0, transcribe_interval=0.5):
+        print("🎤 Voice collector started (background thread)...")
+        for data in stream_voice_with_text_vad(silence_duration=3.0, transcribe_interval=5.0):
             
             if data["type"] == "speech_started":
                 print("\n🎤 Speech detected! Recording...")
@@ -109,24 +102,17 @@ def voice_collector(voice_queue, min_recording_time):
             elif data["type"] == "status":
                 current_text = data.get("text", "")
                 display_text = current_text if len(current_text) <= 50 else current_text[:47] + "..."
-                elapsed = time.time() - start_time
-                print(f"\r🔴 [{elapsed:.1f}s] Speaking: {display_text:<50}", end="", flush=True)
+                print(f"\r🔴 Speaking: {display_text:<50}", end="", flush=True)
             
             elif data["type"] == "speech_complete":
-                elapsed = time.time() - start_time
-                
-                # Check if minimum time has elapsed
-                if elapsed >= min_recording_time:
-                    speech_metrics = data["metrics"]
-                    print(f"\n✅ Speech complete! (Duration: {elapsed:.1f}s)")
-                    break
-                else:
-                    remaining = min_recording_time - elapsed
-                    print(f"\n⏳ Minimum time not reached. Continuing for {remaining:.1f}s more...")
-                    # Continue collecting - don't break yet
+                speech_metrics = data["metrics"]
+                print("\n✅ Speech complete! Setting stop event...")
+                stop_event.set()  # Signal camera to stop
+                break  # Stop after first complete speech
     
     except Exception as e:
-        print(f"\nVoice collector error: {e}")
+        print(f"\n❌ Voice collector error: {e}")
+        stop_event.set()  # Signal stop even on error
     finally:
         voice_queue.put(speech_metrics)
         print("🎤 Voice collector stopped")
@@ -177,26 +163,27 @@ Then, ask the next interview question."""
 async def collect_and_analyze():
     """Collect camera and voice data - camera in MAIN thread, voice in BACKGROUND"""
     
-    # Create queue for voice data
+    # Create queue and event for coordination
     voice_queue = queue.Queue()
+    stop_event = threading.Event()  # Event to signal when voice collection is done
     
-    # Start voice collector in background thread with minimum recording time
+    # Start voice collector in background thread
     voice_thread = threading.Thread(
         target=voice_collector,
-        args=(voice_queue, MINIMUM_RECORDING_TIME),
+        args=(voice_queue, stop_event),
         daemon=True
     )
     voice_thread.start()
     
-    # Collect camera data in MAIN thread (EXACT same as original tempApp.py)
+    # Collect camera data in MAIN thread
     all_camera_metrics = []
     
     print("\n" + "="*70)
     print("📊 DATA COLLECTION")
     print("="*70)
-    print(f"Minimum recording time: {MINIMUM_RECORDING_TIME}s")
     print("Starting camera metrics collection...")
     print("Voice collector running in background...")
+    print("Speak your answer - collection will stop 3 seconds after you finish speaking.")
     print("Press 'q' in the video window to stop manually.")
     print("="*70 + "\n")
     
@@ -205,17 +192,20 @@ async def collect_and_analyze():
         for metrics in stream_camera_metrics(show_video=True):
             all_camera_metrics.append(metrics)
             
-            # Check if voice thread is still alive
-            if not voice_thread.is_alive():
-                # Voice collector finished - stop camera too
+            # Check if voice collection has completed (stop_event is set)
+            if stop_event.is_set():
                 print("\n🎤 Voice collection complete - stopping camera...")
                 break
+            
+            # Also check for manual quit (though stream_camera_metrics handles 'q' internally)
+            # The generator will stop if 'q' is pressed
     
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        print("\n⚠️  Interrupted by user.")
+        stop_event.set()
     
-    # Wait for voice thread to complete (if not already done)
-    voice_thread.join(timeout=1.0)
+    # Wait for voice thread to complete (should already be done if stop_event was set)
+    voice_thread.join(timeout=2.0)
     
     # Get voice data from queue
     speech_metrics = None
@@ -255,7 +245,6 @@ async def main():
     print("\n" + "="*70)
     print("🎯 INTEGRATED INTERVIEW PRACTICE")
     print("   Camera (Main Thread) + Voice (Background Thread)")
-    print(f"   Minimum Recording Time: {MINIMUM_RECORDING_TIME}s")
     print("="*70)
     
     try:

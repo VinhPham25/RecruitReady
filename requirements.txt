@@ -9,3 +9,4 @@ Create two virtual environments, and install the respective dependencies in each
 
 .venv_agent
     google-adk (9)
+    webrtcvad
