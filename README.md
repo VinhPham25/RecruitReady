@@ -53,10 +53,10 @@ The project follows a modular architecture with clear separation of concerns:
          │
          │ HTTP/SSE
          │
-┌────────▼─────────────────────────────────────┐
+┌────────▼──────────────────────────────────────┐
 │         Backend Services                      │
 ├───────────────────────────────────────────────┤
-│  camera.py  │  voice.py  │  interviewer.py   │
+│  camera.py  │  voice.py  │  interviewer.py    │
 │  (CV)       │  (Audio)   │  (AI Agent)        │
 └───────────────────────────────────────────────┘
          │
